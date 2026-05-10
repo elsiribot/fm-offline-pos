@@ -60,9 +60,12 @@ pub fn parse_notes(s: &str) -> Result<ParsedNotes, String> {
     }
 
     Err(format!(
-        "Could not parse ecash notes. Last error: {last_err} (first bytes: {:02x?}, len: {})",
-        &decodings[0][..decodings[0].len().min(8)],
-        decodings[0].len()
+        "Parse failed: {last_err} (input_len: {}, starts: {:?}, decodings: {}, first_decode_len: {}, first_bytes: {:02x?})",
+        s.len(),
+        &s[..s.len().min(20)],
+        decodings.len(),
+        decodings[0].len(),
+        &decodings[0][..decodings[0].len().min(12)],
     ))
 }
 
