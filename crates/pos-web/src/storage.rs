@@ -85,8 +85,28 @@ impl Wallet {
             }
         }
 
+        tracing::info!(
+            amount_msats,
+            available = ?available,
+            "withdraw_exact: starting coin selection"
+        );
+
         // Plan: how many of each denomination to withdraw
-        let plan = self.plan_withdrawal(amount_msats, &available)?;
+        let plan = match self.plan_withdrawal(amount_msats, &available) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(amount_msats, "withdraw_exact: no valid plan found");
+                return None;
+            }
+        };
+
+        let plan_total: u64 = plan.iter().map(|(d, c)| d * (*c as u64)).sum();
+        tracing::info!(
+            plan = ?plan,
+            plan_total,
+            delta = plan_total as i64 - amount_msats as i64,
+            "withdraw_exact: plan selected"
+        );
 
         // Execute the plan
         let mut selected = Vec::new();
@@ -95,23 +115,6 @@ impl Wallet {
             for _ in 0..*count {
                 selected.push(notes.pop()?);
             }
-        }
-
-        // Verify we got the right amount
-        let total: u64 = plan.iter().map(|(d, c)| d * (*c as u64)).sum();
-        if total != amount_msats {
-            // Put notes back
-            for (i, s) in selected.into_iter().enumerate() {
-                let mut offset = 0;
-                for (denom, count) in &plan {
-                    if i >= offset && i < offset + count {
-                        self.notes.entry(*denom).or_default().push(s);
-                        break;
-                    }
-                    offset += count;
-                }
-            }
-            return None;
         }
 
         self.save();
@@ -143,6 +146,7 @@ impl Wallet {
             let use_n = (remaining / denom) as usize;
             let use_n = use_n.min(have);
             if use_n > 0 {
+                tracing::debug!(denom, use_n, remaining, "plan: greedy take");
                 *plan.entry(*denom).or_insert(0) += use_n;
                 *avail.get_mut(denom).expect("have") -= use_n;
                 remaining -= denom * use_n as u64;
@@ -151,8 +155,11 @@ impl Wallet {
 
         // Exact or close enough (gave slightly too little change, delta <= 1 sat)
         if remaining <= TOLERANCE {
+            tracing::debug!(remaining, "plan: greedy sufficient");
             return Some(plan);
         }
+
+        tracing::debug!(remaining, plan = ?plan, "plan: greedy insufficient, trying bump");
 
         // Pass 2: go back up, find smallest available tier, add one,
         // drop everything below it
@@ -178,12 +185,16 @@ impl Wallet {
             let total: u64 = new_plan.iter().map(|(d, c)| d * *c as u64).sum();
             let delta = total.saturating_sub(amount);
 
+            tracing::debug!(bump_denom, delta, new_plan = ?new_plan, "plan: bump candidate");
+
             // Over-changed by <= 1 sat — acceptable
             if delta <= TOLERANCE {
+                tracing::debug!(bump_denom, delta, "plan: bump accepted");
                 return Some(new_plan);
             }
         }
 
+        tracing::warn!(amount, remaining, "plan: no valid plan found");
         None
     }
 
