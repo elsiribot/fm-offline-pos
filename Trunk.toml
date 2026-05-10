@@ -1,0 +1,12 @@
+[build]
+dist = "dist"
+target = "index.html"
+filehash = false
+
+[watch]
+watch = ["crates/pos-web", "public", "index.html", "style.css"]
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+open = false
