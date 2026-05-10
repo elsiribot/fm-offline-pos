@@ -348,7 +348,8 @@ fn ScanDepositView(
     config: RwSignal<Option<PosConfig>>,
     wallet: RwSignal<Wallet>,
 ) -> impl IntoView {
-    let scanning = RwSignal::new(false);
+    let scanning = RwSignal::new(true); // default to scanner
+    let show_manual = RwSignal::new(false);
     let paste_input = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let progress = RwSignal::new(0.0f64);
@@ -446,6 +447,15 @@ fn ScanDepositView(
         if !data.is_empty() { process_ecash(data); }
     };
 
+    // Auto-start scanner on mount
+    {
+        let start = start_scan.clone();
+        spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(100).await;
+            start(leptos::ev::MouseEvent::new("click").unwrap_or_else(|_| panic!("event")));
+        });
+    }
+
     view! {
         <div class="setup-card">
             <h2>"Scan Ecash"</h2>
@@ -460,11 +470,12 @@ fn ScanDepositView(
                             </div>
                         </div>
                         <div class="scanner-overlay">
-                            <button class="btn btn-gray" on:click=move |_| scanning.set(false)>"Cancel"</button>
+                            <button class="btn btn-gray" style="margin-right: 0.5rem;" on:click=move |_| { scanning.set(false); show_manual.set(true); }>"Enter manually"</button>
+                            <button class="btn btn-gray" on:click=move |_| { scanning.set(false); view.set(AppView::Pos); }>"Cancel"</button>
                         </div>
                     </div>
                 }.into_any()
-            } else {
+            } else if show_manual.get() {
                 view! {
                     <div>
                         <textarea rows=3 placeholder="Paste ecash notes here..."
@@ -474,9 +485,16 @@ fn ScanDepositView(
                         ></textarea>
                         <div style="display: flex; gap: 0.5rem;">
                             <button class="btn btn-blue" style="flex: 1;" on:click=on_paste_submit>"Submit"</button>
-                            <button class="btn btn-gray" style="flex: 1;" on:click=start_scan>"Scan QR"</button>
+                            <button class="btn btn-gray" style="flex: 1;" on:click=move |_| { show_manual.set(false); scanning.set(true); }>"Scan QR"</button>
                         </div>
-                        <button class="btn btn-gray" style="margin-top: 0.5rem;" on:click=move |_| view.set(AppView::Pos)>"Skip"</button>
+                        <button class="btn btn-gray" style="margin-top: 0.5rem;" on:click=move |_| view.set(AppView::Pos)>"Cancel"</button>
+                    </div>
+                }.into_any()
+            } else {
+                view! {
+                    <div style="text-align: center; padding: 2rem;">
+                        <button class="btn btn-blue" style="margin-bottom: 0.5rem;" on:click=start_scan>"Scan QR"</button>
+                        <button class="btn btn-gray" on:click=move |_| show_manual.set(true)>"Enter manually"</button>
                     </div>
                 }.into_any()
             }}
@@ -587,7 +605,8 @@ fn AwaitPaymentView(
     wallet: RwSignal<Wallet>,
     config: RwSignal<Option<PosConfig>>,
 ) -> impl IntoView {
-    let scanning = RwSignal::new(false);
+    let scanning = RwSignal::new(true); // default to scanner
+    let show_manual = RwSignal::new(false);
     let paste_input = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let progress = RwSignal::new(0.0f64);
@@ -718,6 +737,15 @@ fn AwaitPaymentView(
         if !data.is_empty() { process_payment(data); }
     };
 
+    // Auto-start scanner on mount
+    {
+        let start = start_scan.clone();
+        spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(100).await;
+            start(leptos::ev::MouseEvent::new("click").unwrap_or_else(|_| panic!("event")));
+        });
+    }
+
     view! {
         <div class="setup-card">
             <h2>"Awaiting Payment"</h2>
@@ -735,11 +763,12 @@ fn AwaitPaymentView(
                             </div>
                         </div>
                         <div class="scanner-overlay">
-                            <button class="btn btn-gray" on:click=move |_| scanning.set(false)>"Cancel"</button>
+                            <button class="btn btn-gray" style="margin-right: 0.5rem;" on:click=move |_| { scanning.set(false); show_manual.set(true); }>"Enter manually"</button>
+                            <button class="btn btn-gray" on:click=move |_| { scanning.set(false); view.set(AppView::Pos); }>"Cancel"</button>
                         </div>
                     </div>
                 }.into_any()
-            } else {
+            } else if show_manual.get() {
                 view! {
                     <div>
                         <textarea rows=3 placeholder="Paste ecash here..."
@@ -749,12 +778,20 @@ fn AwaitPaymentView(
                         ></textarea>
                         <div style="display: flex; gap: 0.5rem;">
                             <button class="btn btn-blue" style="flex: 1;" on:click=on_paste>"Submit"</button>
-                            <button class="btn btn-gray" style="flex: 1;" on:click=start_scan>"Scan QR"</button>
+                            <button class="btn btn-gray" style="flex: 1;" on:click=move |_| { show_manual.set(false); scanning.set(true); }>"Scan QR"</button>
                         </div>
+                        <button class="btn btn-gray" style="margin-top: 0.5rem;" on:click=move |_| view.set(AppView::Pos)>"Cancel"</button>
+                    </div>
+                }.into_any()
+            } else {
+                view! {
+                    <div style="text-align: center; padding: 2rem;">
+                        <p style="color: #6b7280; margin-bottom: 1rem;">"Scan customer's ecash QR code"</p>
+                        <button class="btn btn-blue" style="margin-bottom: 0.5rem;" on:click=start_scan>"Scan QR"</button>
+                        <button class="btn btn-gray" on:click=move |_| show_manual.set(true)>"Enter manually"</button>
                     </div>
                 }.into_any()
             }}
-            <button class="btn btn-gray" style="margin-top: 0.75rem;" on:click=move |_| view.set(AppView::Pos)>"Cancel"</button>
             {move || error.get().map(|e| view! {
                 <div class="warning-banner" style="margin-top: 0.75rem;">{e}</div>
             })}
