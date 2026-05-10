@@ -31,12 +31,16 @@ impl ParsedNotes {
     }
 }
 
-/// Parse ecash string (base64url, base64 standard, or bech32/base32)
+/// Parse ecash string (base64url, base64 standard, or fedimint base32)
 pub fn parse_notes(s: &str) -> Result<ParsedNotes, String> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
 
     let bytes = decode_note_string(&s)?;
+    if bytes.is_empty() {
+        return Err("Decoded ecash data is empty".to_string());
+    }
     parse_note_bytes(&bytes)
+        .map_err(|e| format!("{e} (first bytes: {:02x?}, len: {})", &bytes[..bytes.len().min(8)], bytes.len()))
 }
 
 /// Check if federation prefix matches
@@ -48,17 +52,18 @@ pub fn check_federation(notes: &ParsedNotes, expected_prefix: &FederationIdPrefi
 /// returning the first 4 bytes as prefix.
 pub fn parse_invite_code(s: &str) -> Result<[u8; 32], String> {
     let s = s.trim();
-    // Try bech32 "fed1..." format first
-    if s.starts_with("fed1") {
-        let (_hrp, data) = bech32::decode(s).map_err(|e| format!("Invalid invite code: {e}"))?;
-        return parse_invite_bytes(&data);
-    }
-    // Try base32 "fedimint1..." format
-    if s.starts_with("fedimint1") {
-        let bytes = decode_fedimint_base32(s)?;
+    let lower = s.to_lowercase();
+    // Try fedimint base32hex "fedimint..." format
+    if lower.starts_with("fedimint") {
+        let bytes = decode_fedimint_base32(&lower)?;
         return parse_invite_bytes(&bytes);
     }
-    Err("Invite code must start with 'fed1' or 'fedimint1'".to_string())
+    // Try bech32 "fed1..." format
+    if lower.starts_with("fed1") {
+        let (_hrp, data) = bech32::decode(&lower).map_err(|e| format!("Invalid invite code: {e}"))?;
+        return parse_invite_bytes(&data);
+    }
+    Err("Invite code must start with 'fed1' or 'fedimint'".to_string())
 }
 
 /// Get prefix from full federation ID
@@ -125,26 +130,100 @@ const BASE64_URL_SAFE: base64::engine::GeneralPurpose = base64::engine::GeneralP
     base64::engine::general_purpose::PAD,
 );
 
+const BASE64_URL_SAFE_NO_PAD: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::URL_SAFE,
+    base64::engine::general_purpose::NO_PAD,
+);
+
+const BASE64_STANDARD_NO_PAD: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::general_purpose::NO_PAD,
+);
+
 fn decode_note_string(s: &str) -> Result<Vec<u8>, String> {
-    // Try fedimint base32 prefix
-    if s.starts_with("fedimint1") {
-        return decode_fedimint_base32(s);
+    let lower = s.to_lowercase();
+    // Try fedimint base32hex prefix (NOT bech32, it's custom RFC 4648 base32hex)
+    if lower.starts_with("fedimint") {
+        return decode_fedimint_base32(&lower);
     }
-    // Try base64 URL-safe
+    // Try all base64 variants (with and without padding, URL-safe and standard)
     if let Ok(bytes) = BASE64_URL_SAFE.decode(s) {
-        return Ok(bytes);
+        if !bytes.is_empty() { return Ok(bytes); }
     }
-    // Try base64 standard
+    if let Ok(bytes) = BASE64_URL_SAFE_NO_PAD.decode(s) {
+        if !bytes.is_empty() { return Ok(bytes); }
+    }
     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s) {
-        return Ok(bytes);
+        if !bytes.is_empty() { return Ok(bytes); }
     }
-    Err("Could not decode ecash string (not valid base64 or base32)".to_string())
+    if let Ok(bytes) = BASE64_STANDARD_NO_PAD.decode(s) {
+        if !bytes.is_empty() { return Ok(bytes); }
+    }
+    Err("Could not decode ecash string (not valid base64 or fedimint base32)".to_string())
 }
 
+/// Fedimint uses RFC 4648 base32hex (lowercase) with a "fedimint" text prefix.
+/// This is NOT bech32.
 fn decode_fedimint_base32(s: &str) -> Result<Vec<u8>, String> {
-    // fedimint base32 is bech32m with hrp "fedimint"
-    let (_hrp, data) = bech32::decode(s).map_err(|e| format!("Invalid base32: {e}"))?;
-    Ok(data)
+    const PREFIX: &str = "fedimint";
+    if !s.starts_with(PREFIX) {
+        return Err("Missing fedimint prefix".to_string());
+    }
+    let encoded = &s[PREFIX.len()..];
+    base32hex_decode(encoded)
+}
+
+/// RFC 4648 base32hex decode (lowercase alphabet: 0-9 a-v)
+fn base32hex_decode(input: &str) -> Result<Vec<u8>, String> {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+
+    let mut output = Vec::with_capacity((5 * input.len()) / 8 + 1);
+    let mut buffer: usize = 0;
+    let mut bits: usize = 0;
+
+    for &byte in input.as_bytes() {
+        let value = ALPHABET
+            .iter()
+            .position(|&c| c == byte)
+            .ok_or_else(|| format!("Invalid base32 character: '{}'", byte as char))?;
+
+        buffer |= value << bits;
+        bits += 5;
+
+        while bits >= 8 {
+            output.push((buffer & 0xFF) as u8);
+            buffer >>= 8;
+            bits -= 8;
+        }
+    }
+
+    Ok(output)
+}
+
+/// RFC 4648 base32hex encode (lowercase)
+fn base32hex_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+
+    let mut output = Vec::with_capacity((8 * input.len()) / 5 + 1);
+    let mut buffer: usize = 0;
+    let mut bits: usize = 0;
+
+    for &byte in input {
+        buffer |= (byte as usize) << bits;
+        bits += 8;
+
+        while bits >= 5 {
+            output.push(ALPHABET[buffer & 0b11111]);
+            buffer >>= 5;
+            bits -= 5;
+        }
+    }
+
+    if bits > 0 {
+        output.push(ALPHABET[buffer & 0b11111]);
+    }
+
+    String::from_utf8(output).unwrap_or_default()
 }
 
 /// Read a BigSize (varint) from a reader - same as Lightning BigSize
