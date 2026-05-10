@@ -1,6 +1,5 @@
 //! Minimal ecash note parsing without depending on the full fedimint crates.
-//! Implements just enough of the consensus encoding to parse OOBNotes,
-//! extract the federation ID prefix, and count notes by denomination.
+//! Supports both v1 OOBNotes and v2 ECash formats.
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
@@ -18,8 +17,14 @@ pub struct ParsedNotes {
     pub denominations: BTreeMap<u64, usize>,
     /// The raw bytes for each denomination: denomination_msats -> list of raw note bytes
     raw_notes: BTreeMap<u64, Vec<Vec<u8>>>,
-    /// The original encoded bytes (for re-encoding subsets)
-    original_bytes: Vec<u8>,
+    /// Which format was used (for re-encoding)
+    format: NoteFormat,
+}
+
+#[derive(Clone, Debug)]
+enum NoteFormat {
+    V1, // OOBNotes
+    V2, // mintv2 ECash
 }
 
 impl ParsedNotes {
@@ -31,16 +36,34 @@ impl ParsedNotes {
     }
 }
 
-/// Parse ecash string (base64url, base64 standard, or fedimint base32)
+/// Parse ecash string (fedimint base32, base64url, or base64 standard)
 pub fn parse_notes(s: &str) -> Result<ParsedNotes, String> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
 
-    let bytes = decode_note_string(&s)?;
-    if bytes.is_empty() {
-        return Err("Decoded ecash data is empty".to_string());
+    // Try all decodings and all formats, collect errors
+    let decodings = decode_all_variants(&s);
+    if decodings.is_empty() {
+        return Err("Could not decode ecash string".to_string());
     }
-    parse_note_bytes(&bytes)
-        .map_err(|e| format!("{e} (first bytes: {:02x?}, len: {})", &bytes[..bytes.len().min(8)], bytes.len()))
+
+    let mut last_err = String::new();
+    for bytes in &decodings {
+        // Try v1 OOBNotes format
+        if let Ok(parsed) = parse_v1_oob_notes(bytes) {
+            return Ok(parsed);
+        }
+        // Try v2 ECash format
+        match parse_v2_ecash(bytes) {
+            Ok(parsed) => return Ok(parsed),
+            Err(e) => last_err = e,
+        }
+    }
+
+    Err(format!(
+        "Could not parse ecash notes. Last error: {last_err} (first bytes: {:02x?}, len: {})",
+        &decodings[0][..decodings[0].len().min(8)],
+        decodings[0].len()
+    ))
 }
 
 /// Check if federation prefix matches
@@ -48,8 +71,7 @@ pub fn check_federation(notes: &ParsedNotes, expected_prefix: &FederationIdPrefi
     notes.federation_id_prefix == *expected_prefix
 }
 
-/// Parse a federation invite code to extract just the federation ID (32 bytes),
-/// returning the first 4 bytes as prefix.
+/// Parse a federation invite code to extract the federation ID (32 bytes).
 pub fn parse_invite_code(s: &str) -> Result<[u8; 32], String> {
     let s = s.trim();
     let lower = s.to_lowercase();
@@ -60,7 +82,8 @@ pub fn parse_invite_code(s: &str) -> Result<[u8; 32], String> {
     }
     // Try bech32 "fed1..." format
     if lower.starts_with("fed1") {
-        let (_hrp, data) = bech32::decode(&lower).map_err(|e| format!("Invalid invite code: {e}"))?;
+        let (_hrp, data) =
+            bech32::decode(&lower).map_err(|e| format!("Invalid invite code: {e}"))?;
         return parse_invite_bytes(&data);
     }
     Err("Invite code must start with 'fed1' or 'fedimint'".to_string())
@@ -77,100 +100,134 @@ pub fn federation_id_to_prefix(fed_id: &[u8; 32]) -> FederationIdPrefix {
 pub fn split_notes_by_denomination(notes: &ParsedNotes) -> BTreeMap<u64, Vec<String>> {
     let mut result: BTreeMap<u64, Vec<String>> = BTreeMap::new();
 
-    for (denom, note_list) in &notes.raw_notes {
-        for note_bytes in note_list {
-            // Encode a single-note OOBNotes: Vec<OOBNotesPart> with FederationIdPrefix + Notes(single)
-            let encoded = encode_single_note_oob(
-                &notes.federation_id_prefix,
-                *denom,
-                note_bytes,
-            );
-            let encoded_str = BASE64_URL_SAFE.encode(&encoded);
-            result.entry(*denom).or_default().push(encoded_str);
+    match notes.format {
+        NoteFormat::V1 => {
+            for (denom, note_list) in &notes.raw_notes {
+                for note_bytes in note_list {
+                    let encoded =
+                        encode_single_note_v1_oob(&notes.federation_id_prefix, *denom, note_bytes);
+                    let encoded_str = BASE64_URL_SAFE.encode(&encoded);
+                    result.entry(*denom).or_default().push(encoded_str);
+                }
+            }
+        }
+        NoteFormat::V2 => {
+            for (denom, note_list) in &notes.raw_notes {
+                for note_bytes in note_list {
+                    let encoded =
+                        encode_single_note_v2_ecash(&notes.federation_id_prefix, note_bytes);
+                    let encoded_str = BASE64_URL_SAFE.encode(&encoded);
+                    result.entry(*denom).or_default().push(encoded_str);
+                }
+            }
         }
     }
 
     result
 }
 
-/// Combine multiple single-note strings into one OOBNotes string
+/// Combine multiple single-note strings into one ecash string
 pub fn combine_note_strings(note_strings: &[String]) -> Result<String, String> {
     if note_strings.is_empty() {
         return Err("No notes to combine".to_string());
     }
 
-    // Parse all notes and collect
     let mut fed_prefix: Option<FederationIdPrefix> = None;
     let mut all_notes: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
+    let mut format = NoteFormat::V1;
 
     for s in note_strings {
-        let bytes = decode_note_string(s)?;
-        let parsed = parse_note_bytes(&bytes)?;
+        let decodings = decode_all_variants(s);
+        let mut parsed = None;
+        for bytes in &decodings {
+            if let Ok(p) = parse_v1_oob_notes(bytes) {
+                parsed = Some(p);
+                break;
+            }
+            if let Ok(p) = parse_v2_ecash(bytes) {
+                parsed = Some(p);
+                break;
+            }
+        }
+        let p = parsed.ok_or("Could not parse note for combining")?;
+
         if let Some(existing) = &fed_prefix {
-            if *existing != parsed.federation_id_prefix {
+            if *existing != p.federation_id_prefix {
                 return Err("Mixed federation notes".to_string());
             }
         } else {
-            fed_prefix = Some(parsed.federation_id_prefix);
+            fed_prefix = Some(p.federation_id_prefix);
+            format = p.format;
         }
-        for (denom, notes) in parsed.raw_notes {
+        for (denom, notes) in p.raw_notes {
             all_notes.entry(denom).or_default().extend(notes);
         }
     }
 
     let prefix = fed_prefix.ok_or("No notes")?;
-    let encoded = encode_multi_note_oob(&prefix, &all_notes);
+    let encoded = match format {
+        NoteFormat::V1 => encode_multi_note_v1_oob(&prefix, &all_notes),
+        NoteFormat::V2 => encode_multi_note_v2_ecash(&prefix, &all_notes),
+    };
     Ok(BASE64_URL_SAFE.encode(&encoded))
 }
 
-// ─── Internal encoding/decoding ──────────────────────────────────
+// ─── Decoding ────────────────────────────────────────────────────
 
 const BASE64_URL_SAFE: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
     &base64::alphabet::URL_SAFE,
     base64::engine::general_purpose::PAD,
 );
 
-const BASE64_URL_SAFE_NO_PAD: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
-    &base64::alphabet::URL_SAFE,
-    base64::engine::general_purpose::NO_PAD,
-);
+const BASE64_URL_SAFE_NO_PAD: base64::engine::GeneralPurpose =
+    base64::engine::GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        base64::engine::general_purpose::NO_PAD,
+    );
 
-const BASE64_STANDARD_NO_PAD: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
-    &base64::alphabet::STANDARD,
-    base64::engine::general_purpose::NO_PAD,
-);
+const BASE64_STANDARD_NO_PAD: base64::engine::GeneralPurpose =
+    base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::general_purpose::NO_PAD,
+    );
 
-fn decode_note_string(s: &str) -> Result<Vec<u8>, String> {
+/// Try all possible decodings and return all that succeed
+fn decode_all_variants(s: &str) -> Vec<Vec<u8>> {
     let lower = s.to_lowercase();
-    // Try fedimint base32hex prefix (NOT bech32, it's custom RFC 4648 base32hex)
+    let mut results = Vec::new();
+
+    // Try fedimint base32hex first (highest priority — most specific prefix)
     if lower.starts_with("fedimint") {
-        return decode_fedimint_base32(&lower);
+        if let Ok(bytes) = decode_fedimint_base32(&lower) {
+            if !bytes.is_empty() {
+                results.push(bytes);
+            }
+        }
     }
-    // Try all base64 variants (with and without padding, URL-safe and standard)
-    if let Ok(bytes) = BASE64_URL_SAFE.decode(s) {
-        if !bytes.is_empty() { return Ok(bytes); }
+
+    // Try base64 variants
+    fn try_b64(results: &mut Vec<Vec<u8>>, s: &str, engine: &impl base64::Engine) {
+        if let Ok(bytes) = engine.decode(s) {
+            if !bytes.is_empty() && !results.iter().any(|r| r == &bytes) {
+                results.push(bytes);
+            }
+        }
     }
-    if let Ok(bytes) = BASE64_URL_SAFE_NO_PAD.decode(s) {
-        if !bytes.is_empty() { return Ok(bytes); }
-    }
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(s) {
-        if !bytes.is_empty() { return Ok(bytes); }
-    }
-    if let Ok(bytes) = BASE64_STANDARD_NO_PAD.decode(s) {
-        if !bytes.is_empty() { return Ok(bytes); }
-    }
-    Err("Could not decode ecash string (not valid base64 or fedimint base32)".to_string())
+    try_b64(&mut results, s, &BASE64_URL_SAFE);
+    try_b64(&mut results, s, &BASE64_URL_SAFE_NO_PAD);
+    try_b64(&mut results, s, &base64::engine::general_purpose::STANDARD);
+    try_b64(&mut results, s, &BASE64_STANDARD_NO_PAD);
+
+    results
 }
 
-/// Fedimint uses RFC 4648 base32hex (lowercase) with a "fedimint" text prefix.
-/// This is NOT bech32.
+/// Fedimint uses RFC 4648 base32hex (lowercase) with "fedimint" text prefix.
 fn decode_fedimint_base32(s: &str) -> Result<Vec<u8>, String> {
     const PREFIX: &str = "fedimint";
     if !s.starts_with(PREFIX) {
         return Err("Missing fedimint prefix".to_string());
     }
-    let encoded = &s[PREFIX.len()..];
-    base32hex_decode(encoded)
+    base32hex_decode(&s[PREFIX.len()..])
 }
 
 /// RFC 4648 base32hex decode (lowercase alphabet: 0-9 a-v)
@@ -226,31 +283,35 @@ fn base32hex_encode(input: &[u8]) -> String {
     String::from_utf8(output).unwrap_or_default()
 }
 
-/// Read a BigSize (varint) from a reader - same as Lightning BigSize
+// ─── Varint (BigSize) ────────────────────────────────────────────
+
 fn read_varint(r: &mut impl Read) -> Result<u64, String> {
     let mut first = [0u8; 1];
-    r.read_exact(&mut first).map_err(|e| format!("Read error: {e}"))?;
+    r.read_exact(&mut first)
+        .map_err(|e| format!("Read error: {e}"))?;
     match first[0] {
         0..=0xfc => Ok(first[0] as u64),
         0xfd => {
             let mut buf = [0u8; 2];
-            r.read_exact(&mut buf).map_err(|e| format!("Read error: {e}"))?;
+            r.read_exact(&mut buf)
+                .map_err(|e| format!("Read error: {e}"))?;
             Ok(u16::from_be_bytes(buf) as u64)
         }
         0xfe => {
             let mut buf = [0u8; 4];
-            r.read_exact(&mut buf).map_err(|e| format!("Read error: {e}"))?;
+            r.read_exact(&mut buf)
+                .map_err(|e| format!("Read error: {e}"))?;
             Ok(u32::from_be_bytes(buf) as u64)
         }
         0xff => {
             let mut buf = [0u8; 8];
-            r.read_exact(&mut buf).map_err(|e| format!("Read error: {e}"))?;
+            r.read_exact(&mut buf)
+                .map_err(|e| format!("Read error: {e}"))?;
             Ok(u64::from_be_bytes(buf))
         }
     }
 }
 
-/// Write a BigSize varint
 fn write_varint(w: &mut Vec<u8>, val: u64) {
     if val <= 0xfc {
         w.push(val as u8);
@@ -266,21 +327,20 @@ fn write_varint(w: &mut Vec<u8>, val: u64) {
     }
 }
 
-/// Parse OOBNotes bytes.
-/// Format: Vec<OOBNotesPart> = varint(len) + len * (variant encoding)
-/// Each enum variant: varint(variant_idx) + varint(body_len) + body_bytes
-///
-/// Variant 0: Notes(TieredMulti<SpendableNote>)
-/// Variant 1: FederationIdPrefix (4 bytes)
-/// Variant 2: Invite { peer_apis, federation_id }
-/// Variant 3: ApiSecret(String)
-fn parse_note_bytes(bytes: &[u8]) -> Result<ParsedNotes, String> {
+// ─── V1 OOBNotes parsing ────────────────────────────────────────
+
+/// Parse v1 OOBNotes: Vec<OOBNotesPart>
+/// OOBNotesPart variants:
+///   0 = Notes(TieredMulti<SpendableNote>)
+///   1 = FederationIdPrefix(4 bytes)
+///   2 = Invite { peer_apis, federation_id }
+///   3 = ApiSecret(String)
+fn parse_v1_oob_notes(bytes: &[u8]) -> Result<ParsedNotes, String> {
     let mut cursor = Cursor::new(bytes);
 
-    // Read Vec length
     let num_parts = read_varint(&mut cursor)?;
     if num_parts == 0 || num_parts > 100 {
-        return Err(format!("Invalid OOBNotes part count: {num_parts}"));
+        return Err(format!("Invalid v1 part count: {num_parts}"));
     }
 
     let mut federation_id_prefix: Option<FederationIdPrefix> = None;
@@ -289,21 +349,21 @@ fn parse_note_bytes(bytes: &[u8]) -> Result<ParsedNotes, String> {
 
     for _ in 0..num_parts {
         let variant_idx = read_varint(&mut cursor)?;
-        // Read body as Vec<u8>: varint(len) + bytes
         let body_len = read_varint(&mut cursor)?;
         if body_len > 10_000_000 {
-            return Err("OOBNotes body too large".to_string());
+            return Err("Body too large".to_string());
         }
         let mut body = vec![0u8; body_len as usize];
-        cursor.read_exact(&mut body).map_err(|e| format!("Read error: {e}"))?;
+        cursor
+            .read_exact(&mut body)
+            .map_err(|e| format!("Read error: {e}"))?;
 
         match variant_idx {
             0 => {
                 // Notes: TieredMulti<SpendableNote> = BTreeMap<Amount, Vec<SpendableNote>>
-                parse_tiered_multi(&body, &mut denominations, &mut raw_notes)?;
+                parse_v1_tiered_multi(&body, &mut denominations, &mut raw_notes)?;
             }
             1 => {
-                // FederationIdPrefix: 4 bytes
                 if body.len() < 4 {
                     return Err("FederationIdPrefix too short".to_string());
                 }
@@ -312,11 +372,8 @@ fn parse_note_bytes(bytes: &[u8]) -> Result<ParsedNotes, String> {
                 federation_id_prefix = Some(prefix);
             }
             2 => {
-                // Invite: { peer_apis: Vec<(PeerId, SafeUrl)>, federation_id: FederationId }
-                // Extract federation_id (last 32 bytes of the structured data)
-                // We parse: Vec<(u16, String)> then 32 bytes of FederationId
+                // Invite: extract federation_id if we don't have prefix yet
                 if federation_id_prefix.is_none() {
-                    // Try to extract from invite
                     if let Ok(fid) = extract_federation_id_from_invite(&body) {
                         let mut prefix = [0u8; 4];
                         prefix.copy_from_slice(&fid[..4]);
@@ -324,64 +381,54 @@ fn parse_note_bytes(bytes: &[u8]) -> Result<ParsedNotes, String> {
                     }
                 }
             }
-            _ => {
-                // Unknown variant, skip
-            }
+            _ => {} // skip unknown
         }
     }
 
     let federation_id_prefix =
-        federation_id_prefix.ok_or("No federation ID prefix found in ecash notes")?;
+        federation_id_prefix.ok_or("No federation ID in v1 notes")?;
 
     if denominations.is_empty() {
-        return Err("No notes found in ecash data".to_string());
+        return Err("No notes in v1 data".to_string());
     }
 
     Ok(ParsedNotes {
         federation_id_prefix,
         denominations,
         raw_notes,
-        original_bytes: bytes.to_vec(),
+        format: NoteFormat::V1,
     })
 }
 
-/// Parse TieredMulti<SpendableNote> from body bytes
-/// Format: BTreeMap<Amount, Vec<SpendableNote>>
-///   = varint(num_tiers) + for each: (varint(amount_msats), varint(num_notes), note_bytes...)
-/// SpendableNote = signature(48 bytes) + spend_key(32+32 = 64 bytes)
-/// Actually spend_key is a Keypair which is secp256k1 Keypair: 32 bytes secret key
-/// Hmm, let's check...
-fn parse_tiered_multi(
+/// Parse v1 TieredMulti: BTreeMap<Amount, Vec<SpendableNote>>
+/// SpendableNote v1 = signature(48 bytes BLS) + spend_key(32 bytes Keypair) = 80 bytes
+fn parse_v1_tiered_multi(
     body: &[u8],
     denominations: &mut BTreeMap<u64, usize>,
     raw_notes: &mut BTreeMap<u64, Vec<Vec<u8>>>,
 ) -> Result<(), String> {
     let mut cursor = Cursor::new(body);
-
-    // BTreeMap: varint(len) then key-value pairs
     let num_tiers = read_varint(&mut cursor)?;
     if num_tiers > 1000 {
         return Err("Too many tiers".to_string());
     }
 
     for _ in 0..num_tiers {
-        // Amount (u64 varint)
         let amount_msats = read_varint(&mut cursor)?;
-        // Vec<SpendableNote>: varint(len) then items
         let num_notes = read_varint(&mut cursor)?;
         if num_notes > 100_000 {
             return Err("Too many notes in tier".to_string());
         }
 
         for _ in 0..num_notes {
-            // SpendableNote: signature(48 bytes, BLS) + spend_key(Keypair = 32 bytes secret)
-            // Total: 48 + 32 = 80 bytes
             let mut note_bytes = vec![0u8; 80];
             cursor
                 .read_exact(&mut note_bytes)
-                .map_err(|e| format!("Failed to read note: {e}"))?;
-
-            raw_notes.entry(amount_msats).or_default().push(note_bytes);
+                .map_err(|e| format!("Failed to read v1 note: {e}"))?;
+            raw_notes
+                .entry(amount_msats)
+                .or_default()
+                .push(note_bytes);
         }
 
         *denominations.entry(amount_msats).or_insert(0) += num_notes as usize;
@@ -390,36 +437,108 @@ fn parse_tiered_multi(
     Ok(())
 }
 
-/// Try to extract FederationId (32 bytes) from invite body
+// ─── V2 ECash parsing ───────────────────────────────────────────
+
+/// Parse v2 ECash: Vec<ECashField>
+/// ECashField variants:
+///   0 = Mint(FederationId) — 32 bytes
+///   1 = Note(SpendableNote) — denomination(1 byte u8) + keypair(32 bytes) + signature(48 bytes) = 81 bytes
+fn parse_v2_ecash(bytes: &[u8]) -> Result<ParsedNotes, String> {
+    let mut cursor = Cursor::new(bytes);
+
+    let num_fields = read_varint(&mut cursor)?;
+    if num_fields == 0 || num_fields > 100_000 {
+        return Err(format!("Invalid v2 field count: {num_fields}"));
+    }
+
+    let mut federation_id: Option<[u8; 32]> = None;
+    let mut denominations: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut raw_notes: BTreeMap<u64, Vec<Vec<u8>>> = BTreeMap::new();
+
+    for _ in 0..num_fields {
+        let variant_idx = read_varint(&mut cursor)?;
+        let body_len = read_varint(&mut cursor)?;
+        if body_len > 10_000_000 {
+            return Err("Body too large".to_string());
+        }
+        let mut body = vec![0u8; body_len as usize];
+        cursor
+            .read_exact(&mut body)
+            .map_err(|e| format!("Read v2 error: {e}"))?;
+
+        match variant_idx {
+            0 => {
+                // Mint(FederationId) — 32 bytes
+                if body.len() >= 32 {
+                    let mut fid = [0u8; 32];
+                    fid.copy_from_slice(&body[..32]);
+                    federation_id = Some(fid);
+                }
+            }
+            1 => {
+                // Note(SpendableNote) — denomination(u8=1) + keypair(32) + signature(48) = 81 bytes
+                if body.len() >= 81 {
+                    let denomination_byte = body[0];
+                    let amount_msats = 1u64 << (denomination_byte as u64);
+                    *denominations.entry(amount_msats).or_insert(0) += 1;
+                    raw_notes
+                        .entry(amount_msats)
+                        .or_default()
+                        .push(body.to_vec());
+                }
+            }
+            _ => {} // skip unknown
+        }
+    }
+
+    let federation_id = federation_id.ok_or("No federation ID in v2 ecash")?;
+    let mut prefix = [0u8; 4];
+    prefix.copy_from_slice(&federation_id[..4]);
+
+    if denominations.is_empty() {
+        return Err("No notes in v2 ecash".to_string());
+    }
+
+    Ok(ParsedNotes {
+        federation_id_prefix: prefix,
+        denominations,
+        raw_notes,
+        format: NoteFormat::V2,
+    })
+}
+
+// ─── Invite code parsing ────────────────────────────────────────
+
 fn extract_federation_id_from_invite(body: &[u8]) -> Result<[u8; 32], String> {
     let mut cursor = Cursor::new(body);
-    // peer_apis: Vec<(PeerId, SafeUrl)>
-    // PeerId = u16 varint, SafeUrl = String = varint(len) + bytes
+    // peer_apis: Vec<(PeerId(u16 varint), SafeUrl(String))>
     let num_peers = read_varint(&mut cursor)?;
     for _ in 0..num_peers {
-        let _peer_id = read_varint(&mut cursor)?; // u16 as varint
+        let _peer_id = read_varint(&mut cursor)?;
         let url_len = read_varint(&mut cursor)?;
         let mut url_bytes = vec![0u8; url_len as usize];
-        cursor.read_exact(&mut url_bytes).map_err(|e| format!("Read: {e}"))?;
+        cursor
+            .read_exact(&mut url_bytes)
+            .map_err(|e| format!("Read: {e}"))?;
     }
-    // FederationId: 32 bytes (it's a newtype over [u8; 32] encoded as raw bytes)
     let mut fed_id = [0u8; 32];
-    cursor.read_exact(&mut fed_id).map_err(|e| format!("Read fed_id: {e}"))?;
+    cursor
+        .read_exact(&mut fed_id)
+        .map_err(|e| format!("Read fed_id: {e}"))?;
     Ok(fed_id)
 }
 
-/// Parse invite code bytes to extract FederationId
 fn parse_invite_bytes(bytes: &[u8]) -> Result<[u8; 32], String> {
     let mut cursor = Cursor::new(bytes);
-
-    // Vec<InviteCodePart>: varint(len) + parts
     let num_parts = read_varint(&mut cursor)?;
 
     for _ in 0..num_parts {
         let variant_idx = read_varint(&mut cursor)?;
         let body_len = read_varint(&mut cursor)?;
         let mut body = vec![0u8; body_len as usize];
-        cursor.read_exact(&mut body).map_err(|e| format!("Read: {e}"))?;
+        cursor
+            .read_exact(&mut body)
+            .map_err(|e| format!("Read: {e}"))?;
 
         match variant_idx {
             1 => {
@@ -430,53 +549,107 @@ fn parse_invite_bytes(bytes: &[u8]) -> Result<[u8; 32], String> {
                     return Ok(fed_id);
                 }
             }
-            _ => {} // skip Api, ApiSecret, etc.
+            _ => {}
         }
     }
 
     Err("No FederationId found in invite code".to_string())
 }
 
-/// Encode a single note into OOBNotes format
-fn encode_single_note_oob(prefix: &FederationIdPrefix, denom_msats: u64, note_bytes: &[u8]) -> Vec<u8> {
-    encode_multi_note_oob(prefix, &{
-        let mut m = BTreeMap::new();
-        m.insert(denom_msats, vec![note_bytes.to_vec()]);
-        m
-    })
+// ─── V1 Encoding ────────────────────────────────────────────────
+
+fn encode_single_note_v1_oob(
+    prefix: &FederationIdPrefix,
+    denom_msats: u64,
+    note_bytes: &[u8],
+) -> Vec<u8> {
+    let mut m = BTreeMap::new();
+    m.insert(denom_msats, vec![note_bytes.to_vec()]);
+    encode_multi_note_v1_oob(prefix, &m)
 }
 
-/// Encode multiple notes into OOBNotes format
-fn encode_multi_note_oob(prefix: &FederationIdPrefix, notes: &BTreeMap<u64, Vec<Vec<u8>>>) -> Vec<u8> {
+fn encode_multi_note_v1_oob(
+    prefix: &FederationIdPrefix,
+    notes: &BTreeMap<u64, Vec<Vec<u8>>>,
+) -> Vec<u8> {
     let mut out = Vec::new();
-
-    // Vec<OOBNotesPart> with 2 parts: FederationIdPrefix + Notes
     write_varint(&mut out, 2); // 2 parts
 
-    // Part 1: FederationIdPrefix (variant 1)
-    write_varint(&mut out, 1); // variant index
-    write_varint(&mut out, 4); // body length
+    // FederationIdPrefix (variant 1)
+    write_varint(&mut out, 1);
+    write_varint(&mut out, 4);
     out.extend_from_slice(prefix);
 
-    // Part 2: Notes (variant 0)
-    write_varint(&mut out, 0); // variant index
-    // Encode TieredMulti body
+    // Notes (variant 0)
+    write_varint(&mut out, 0);
     let mut notes_body = Vec::new();
-    encode_tiered_multi(&mut notes_body, notes);
+    write_varint(&mut notes_body, notes.len() as u64);
+    for (denom_msats, note_list) in notes {
+        write_varint(&mut notes_body, *denom_msats);
+        write_varint(&mut notes_body, note_list.len() as u64);
+        for note_bytes in note_list {
+            notes_body.extend_from_slice(note_bytes);
+        }
+    }
     write_varint(&mut out, notes_body.len() as u64);
     out.extend_from_slice(&notes_body);
 
     out
 }
 
-/// Encode TieredMulti = BTreeMap<Amount, Vec<SpendableNote>>
-fn encode_tiered_multi(out: &mut Vec<u8>, notes: &BTreeMap<u64, Vec<Vec<u8>>>) {
-    write_varint(out, notes.len() as u64);
-    for (denom_msats, note_list) in notes {
-        write_varint(out, *denom_msats);
-        write_varint(out, note_list.len() as u64);
+// ─── V2 Encoding ────────────────────────────────────────────────
+
+fn encode_single_note_v2_ecash(
+    fed_prefix: &FederationIdPrefix,
+    note_bytes: &[u8],
+) -> Vec<u8> {
+    // We need the full 32-byte federation ID but only have 4-byte prefix.
+    // We store the full note body which includes denomination, so we can reconstruct.
+    // For v2 we need to store a dummy fed ID with matching prefix.
+    let mut fed_id = [0u8; 32];
+    fed_id[..4].copy_from_slice(fed_prefix);
+
+    let mut out = Vec::new();
+    write_varint(&mut out, 2); // 2 fields: Mint + Note
+
+    // Mint (variant 0)
+    write_varint(&mut out, 0);
+    write_varint(&mut out, 32);
+    out.extend_from_slice(&fed_id);
+
+    // Note (variant 1)
+    write_varint(&mut out, 1);
+    write_varint(&mut out, note_bytes.len() as u64);
+    out.extend_from_slice(note_bytes);
+
+    out
+}
+
+fn encode_multi_note_v2_ecash(
+    fed_prefix: &FederationIdPrefix,
+    notes: &BTreeMap<u64, Vec<Vec<u8>>>,
+) -> Vec<u8> {
+    let mut fed_id = [0u8; 32];
+    fed_id[..4].copy_from_slice(fed_prefix);
+
+    let total_notes: usize = notes.values().map(|v| v.len()).sum();
+
+    let mut out = Vec::new();
+    write_varint(&mut out, 1 + total_notes as u64); // Mint + all Notes
+
+    // Mint (variant 0)
+    write_varint(&mut out, 0);
+    write_varint(&mut out, 32);
+    out.extend_from_slice(&fed_id);
+
+    // Notes (variant 1 each)
+    for note_list in notes.values() {
         for note_bytes in note_list {
+            write_varint(&mut out, 1);
+            write_varint(&mut out, note_bytes.len() as u64);
             out.extend_from_slice(note_bytes);
         }
     }
+
+    out
 }
