@@ -386,6 +386,7 @@ fn ScanDepositView(
                     currency: "sat".to_string(),
                     fiat_amount: total as f64 / 1000.0,
                     change_msats: 0,
+                    paid_msats: total,
                     tx_type: TxType::Deposit,
                 });
                 view.set(AppView::Pos);
@@ -646,35 +647,48 @@ fn AwaitPaymentView(
                 }
                 wallet.update(|w| w.deposit(split));
 
-                let change_msats = received_msats.saturating_sub(requested_msats);
-
-                storage::add_transaction(Transaction {
-                    timestamp: js_sys::Date::now() as u64,
-                    amount_msats: requested_msats,
-                    currency: "sat".to_string(),
-                    fiat_amount: requested_msats as f64 / 1000.0,
-                    change_msats,
-                    tx_type: TxType::Sale,
-                });
+                let change_msats_raw = received_msats.saturating_sub(requested_msats);
+                // Round change down to nearest sat (1000 msats) for composability
+                let change_msats = (change_msats_raw / 1000) * 1000;
 
                 if change_msats > 0 {
                     let mut w = wallet.get();
                     if let Some(change_notes) = w.withdraw_exact(change_msats) {
                         wallet.set(w);
-                        match ecash::combine_note_strings(&change_notes) {
-                            Ok(ecash_str) => {
-                                view.set(AppView::GiveChange {
-                                    ecash_str,
-                                    received_sats: received_msats / 1000,
-                                    change_sats: change_msats / 1000,
-                                });
-                                return;
-                            }
-                            Err(_) => {}
+                        if let Ok(ecash_str) = ecash::combine_note_strings(&change_notes) {
+                            storage::add_transaction(Transaction {
+                                timestamp: js_sys::Date::now() as u64,
+                                amount_msats: requested_msats,
+                                currency: "sat".to_string(),
+                                fiat_amount: requested_msats as f64 / 1000.0,
+                                paid_msats: received_msats,
+                                change_msats,
+                                tx_type: TxType::Sale,
+                            });
+                            view.set(AppView::GiveChange {
+                                ecash_str,
+                                received_sats: received_msats / 1000,
+                                change_sats: change_msats / 1000,
+                            });
+                            return;
                         }
                     }
-                    error.set(Some(format!("Payment accepted! Could not give exact change of {} sats.", change_msats / 1000)));
+                    error.set(Some(format!(
+                        "Not enough change! Need {} sats in small denominations. Deposit more ecash from admin.",
+                        change_msats / 1000
+                    )));
+                    return;
                 }
+                // No change needed
+                storage::add_transaction(Transaction {
+                    timestamp: js_sys::Date::now() as u64,
+                    amount_msats: requested_msats,
+                    currency: "sat".to_string(),
+                    fiat_amount: requested_msats as f64 / 1000.0,
+                    paid_msats: received_msats,
+                    change_msats: 0,
+                    tx_type: TxType::Sale,
+                });
                 view.set(AppView::PaymentSuccess {
                     received_sats: received_msats / 1000,
                     change_sats: 0,
@@ -1009,6 +1023,7 @@ fn AdminView(
                     amount_msats: withdraw_msats,
                     currency: "sat".to_string(),
                     fiat_amount: withdraw_msats as f64 / 1000.0,
+                    paid_msats: 0,
                     change_msats: 0,
                     tx_type: TxType::Withdrawal,
                 });
@@ -1057,12 +1072,27 @@ fn AdminView(
                                         TxType::Deposit => ("+", "#2563eb"),
                                         TxType::Withdrawal => ("-", "#dc2626"),
                                     };
+                                    let detail = if tx.tx_type == TxType::Sale && tx.paid_msats > 0 {
+                                        format!(
+                                            "charged {} | paid {} | change {}",
+                                            tx.amount_msats / 1000,
+                                            tx.paid_msats / 1000,
+                                            tx.change_msats / 1000,
+                                        )
+                                    } else {
+                                        String::new()
+                                    };
                                     view! {
-                                        <div class="transaction-item">
-                                            <span style="font-size: 0.875rem;">{tx.tx_type.to_string()}</span>
-                                            <span style=format!("font-weight: 600; color: {};", color)>
-                                                {format!("{}{} sats", sign, tx.amount_msats / 1000)}
-                                            </span>
+                                        <div class="transaction-item" style="flex-direction: column; align-items: flex-start;">
+                                            <div style="display: flex; justify-content: space-between; width: 100%;">
+                                                <span style="font-size: 0.875rem;">{tx.tx_type.to_string()}</span>
+                                                <span style=format!("font-weight: 600; color: {};", color)>
+                                                    {format!("{}{} sats", sign, tx.amount_msats / 1000)}
+                                                </span>
+                                            </div>
+                                            {(!detail.is_empty()).then(|| view! {
+                                                <span style="font-size: 0.75rem; color: #6b7280;">{detail}</span>
+                                            })}
                                         </div>
                                     }
                                 }).collect::<Vec<_>>()}

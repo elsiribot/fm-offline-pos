@@ -38,6 +38,14 @@ impl Wallet {
             .collect()
     }
 
+    /// Smallest denomination currently in the wallet
+    pub fn smallest_denomination(&self) -> Option<u64> {
+        self.notes.iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(d, _)| *d)
+            .next()
+    }
+
     /// Check if any of the given notes are already in the wallet
     pub fn contains_any(&self, split: &BTreeMap<u64, Vec<String>>) -> bool {
         for (denom, new_notes) in split {
@@ -61,35 +69,46 @@ impl Wallet {
     }
 
     /// Withdraw exact amount in msats, returning the note strings.
-    /// Uses greedy algorithm: pick largest denominations first.
-    /// Returns None if insufficient funds.
+    ///
+    /// Uses binary decomposition: since denominations are powers of 2,
+    /// we determine how many of each denomination we need from the
+    /// binary representation of the target amount. If a needed denomination
+    /// isn't available, we use multiple smaller ones (splitting down).
+    /// If smaller ones aren't available either, we take one larger note
+    /// and make change internally (splitting up then down).
     pub fn withdraw_exact(&mut self, amount_msats: u64) -> Option<Vec<String>> {
-        let mut remaining = amount_msats;
-        let mut selected = Vec::new();
-
-        // Collect denominations in descending order
-        let denoms: Vec<u64> = self.notes.keys().rev().cloned().collect();
-
-        for denom in denoms {
-            if remaining == 0 {
-                break;
-            }
-            if let Some(notes) = self.notes.get_mut(&denom) {
-                while remaining >= denom && !notes.is_empty() {
-                    if let Some(note) = notes.pop() {
-                        selected.push(note);
-                        remaining -= denom;
-                    }
-                }
+        // Build availability map: denom -> count available
+        let mut available: BTreeMap<u64, usize> = BTreeMap::new();
+        for (denom, notes) in &self.notes {
+            if !notes.is_empty() {
+                available.insert(*denom, notes.len());
             }
         }
 
-        if remaining > 0 {
+        // Plan: how many of each denomination to withdraw
+        let plan = self.plan_withdrawal(amount_msats, &available)?;
+
+        // Execute the plan
+        let mut selected = Vec::new();
+        for (denom, count) in &plan {
+            let notes = self.notes.get_mut(denom)?;
+            for _ in 0..*count {
+                selected.push(notes.pop()?);
+            }
+        }
+
+        // Verify we got the right amount
+        let total: u64 = plan.iter().map(|(d, c)| d * (*c as u64)).sum();
+        if total != amount_msats {
             // Put notes back
-            for s in &selected {
-                if let Ok(parsed) = crate::ecash::parse_notes(s) {
-                    let msats = parsed.total_msats();
-                    self.notes.entry(msats).or_default().push(s.clone());
+            for (i, s) in selected.into_iter().enumerate() {
+                let mut offset = 0;
+                for (denom, count) in &plan {
+                    if i >= offset && i < offset + count {
+                        self.notes.entry(*denom).or_default().push(s);
+                        break;
+                    }
+                    offset += count;
                 }
             }
             return None;
@@ -97,6 +116,75 @@ impl Wallet {
 
         self.save();
         Some(selected)
+    }
+
+    /// Plan how many of each denomination to withdraw for a given amount.
+    ///
+    /// Go largest to smallest, take notes while remainder >= denom.
+    /// If we can't hit exact amount, accept if delta <= 1 sat (under-change).
+    /// Otherwise add one more of the smallest available tier, drop everything
+    /// below it, accept if delta <= 1 sat (over-change). Fail otherwise.
+    fn plan_withdrawal(
+        &self,
+        amount: u64,
+        available: &BTreeMap<u64, usize>,
+    ) -> Option<BTreeMap<u64, usize>> {
+        const TOLERANCE: u64 = 1000; // 1 sat in msats
+
+        let mut remaining = amount;
+        let mut plan: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut avail = available.clone();
+
+        // Pass 1: largest to smallest, take while remainder >= denom
+        let denoms: Vec<u64> = avail.keys().rev().cloned().collect();
+        for denom in &denoms {
+            if remaining == 0 { break; }
+            let have = avail.get(&denom).copied().unwrap_or(0);
+            let use_n = (remaining / denom) as usize;
+            let use_n = use_n.min(have);
+            if use_n > 0 {
+                *plan.entry(*denom).or_insert(0) += use_n;
+                *avail.get_mut(denom).expect("have") -= use_n;
+                remaining -= denom * use_n as u64;
+            }
+        }
+
+        // Exact or close enough (gave slightly too little change, delta <= 1 sat)
+        if remaining <= TOLERANCE {
+            return Some(plan);
+        }
+
+        // Pass 2: go back up, find smallest available tier, add one,
+        // drop everything below it
+        let smallest_available: Vec<u64> = avail.iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(d, _)| *d)
+            .collect(); // already sorted ascending (BTreeMap)
+
+        for bump_denom in &smallest_available {
+            if *bump_denom <= remaining {
+                continue; // too small, greedy would have taken it
+            }
+            // Add one of this denomination
+            let mut new_plan = plan.clone();
+            *new_plan.entry(*bump_denom).or_insert(0) += 1;
+
+            // Remove all denominations below it from the plan
+            let remove: Vec<u64> = new_plan.keys().filter(|d| **d < *bump_denom).cloned().collect();
+            for d in &remove {
+                new_plan.remove(d);
+            }
+
+            let total: u64 = new_plan.iter().map(|(d, c)| d * *c as u64).sum();
+            let delta = total.saturating_sub(amount);
+
+            // Over-changed by <= 1 sat — acceptable
+            if delta <= TOLERANCE {
+                return Some(new_plan);
+            }
+        }
+
+        None
     }
 
     /// Withdraw up to amount, picking from smallest denominations first for change-giving.
@@ -228,6 +316,9 @@ pub struct Transaction {
     pub currency: String,
     pub fiat_amount: f64,
     pub change_msats: u64,
+    /// Amount actually paid by customer (for sales)
+    #[serde(default)]
+    pub paid_msats: u64,
     pub tx_type: TxType,
 }
 
