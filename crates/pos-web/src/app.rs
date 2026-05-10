@@ -374,6 +374,10 @@ fn ScanDepositView(
                 }
                 let total = notes.total_msats();
                 let split = ecash::split_notes_by_denomination(&notes);
+                if wallet.get().contains_any(&split) {
+                    error.set(Some("These notes are already in the wallet!".to_string()));
+                    return;
+                }
                 wallet.update(|w| w.deposit(split));
                 storage::add_transaction(Transaction {
                     timestamp: js_sys::Date::now() as u64,
@@ -617,6 +621,10 @@ fn AwaitPaymentView(
 
                 // Deposit received notes
                 let split = ecash::split_notes_by_denomination(&notes);
+                if wallet.get().contains_any(&split) {
+                    error.set(Some("These notes are already in the wallet! Possible double-spend attempt.".to_string()));
+                    return;
+                }
                 wallet.update(|w| w.deposit(split));
 
                 let change_msats = received_msats.saturating_sub(requested_msats);

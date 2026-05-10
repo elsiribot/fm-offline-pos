@@ -38,6 +38,20 @@ impl Wallet {
             .collect()
     }
 
+    /// Check if any of the given notes are already in the wallet
+    pub fn contains_any(&self, split: &BTreeMap<u64, Vec<String>>) -> bool {
+        for (denom, new_notes) in split {
+            if let Some(existing) = self.notes.get(denom) {
+                for note in new_notes {
+                    if existing.contains(note) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Add notes (already split by denomination)
     pub fn deposit(&mut self, split: BTreeMap<u64, Vec<String>>) {
         for (denom, notes) in split {
