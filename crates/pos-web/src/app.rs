@@ -15,7 +15,8 @@ enum AppView {
     Setup(SetupStep),
     Pos,
     AwaitPayment(u64), // requested msats
-    GiveChange(String),
+    PaymentSuccess { received_sats: u64, change_sats: u64 },
+    GiveChange { ecash_str: String, received_sats: u64, change_sats: u64 },
     PinEntry,
     Admin,
     AdminWithdraw(String),
@@ -60,9 +61,12 @@ pub fn App() -> impl IntoView {
                     AppView::AwaitPayment(msats) => view! {
                         <AwaitPaymentView requested_msats=msats view=view wallet=wallet config=config />
                     }.into_any(),
-                    AppView::GiveChange(ref ecash_str) => {
+                    AppView::PaymentSuccess { received_sats, change_sats } => view! {
+                        <PaymentSuccessView received_sats=received_sats change_sats=change_sats view=view />
+                    }.into_any(),
+                    AppView::GiveChange { ref ecash_str, received_sats, change_sats } => {
                         let s = ecash_str.clone();
-                        view! { <AnimatedQrView title="Scan to receive change".to_string() ecash_str=s view=view /> }.into_any()
+                        view! { <GiveChangeView ecash_str=s received_sats=received_sats change_sats=change_sats view=view /> }.into_any()
                     },
                     AppView::PinEntry => view! {
                         <PinEntryView view=view config=config />
@@ -632,16 +636,22 @@ fn AwaitPaymentView(
                         wallet.set(w);
                         match ecash::combine_note_strings(&change_notes) {
                             Ok(ecash_str) => {
-                                view.set(AppView::GiveChange(ecash_str));
+                                view.set(AppView::GiveChange {
+                                    ecash_str,
+                                    received_sats: received_msats / 1000,
+                                    change_sats: change_msats / 1000,
+                                });
                                 return;
                             }
                             Err(_) => {}
                         }
                     }
-                    // Couldn't give exact change
                     error.set(Some(format!("Payment accepted! Could not give exact change of {} sats.", change_msats / 1000)));
                 }
-                view.set(AppView::Pos);
+                view.set(AppView::PaymentSuccess {
+                    received_sats: received_msats / 1000,
+                    change_sats: 0,
+                });
             }
             Err(e) => error.set(Some(e)),
         }
@@ -787,6 +797,84 @@ fn AnimatedQrView(title: String, ecash_str: String, view: RwSignal<AppView>) -> 
                 </p>
             })}
             <button class="btn btn-blue" style="margin-top: 1rem;" on:click=move |_| view.set(AppView::Pos)>"Done"</button>
+        </div>
+    }
+}
+
+// ─── Payment Success ────────────────────────────────────────────
+
+#[component]
+fn PaymentSuccessView(received_sats: u64, change_sats: u64, view: RwSignal<AppView>) -> impl IntoView {
+    view! {
+        <div class="setup-card" style="text-align: center;">
+            <div style="font-size: 3rem; margin-bottom: 0.5rem;">{"\u{2705}"}</div>
+            <h2 style="color: #059669;">"Payment Received!"</h2>
+            <p style="font-size: 1.5rem; font-weight: 700; margin: 1rem 0;">
+                {format!("{} sats", received_sats)}
+            </p>
+            {(change_sats > 0).then(|| view! {
+                <p style="color: #6b7280; font-size: 0.875rem;">
+                    {format!("Change: {} sats", change_sats)}
+                </p>
+            })}
+            <button class="btn btn-blue" style="margin-top: 1.5rem;" on:click=move |_| view.set(AppView::Pos)>
+                "New Sale"
+            </button>
+        </div>
+    }
+}
+
+// ─── Give Change ────────────────────────────────────────────────
+
+#[component]
+fn GiveChangeView(ecash_str: String, received_sats: u64, change_sats: u64, view: RwSignal<AppView>) -> impl IntoView {
+    let frames = qr::split_for_animated_qr(&ecash_str, QR_CHUNK_SIZE);
+    let frame_count = frames.len();
+    let current_frame = RwSignal::new(0usize);
+    let frames_signal = RwSignal::new(frames);
+
+    if frame_count > 1 {
+        spawn_local(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(250).await;
+                current_frame.update(|f| *f = (*f + 1) % frame_count);
+            }
+        });
+    }
+
+    view! {
+        <div class="setup-card" style="text-align: center;">
+            <h2 style="color: #059669;">"Payment Received!"</h2>
+            <p style="font-size: 1.25rem; font-weight: 700; margin: 0.5rem 0;">
+                {format!("{} sats", received_sats)}
+            </p>
+            <div class="warning-banner" style="background: #dbeafe; border-color: #3b82f6; color: #1e40af;">
+                {format!("Customer change: {} sats", change_sats)}
+            </div>
+            <p style="color: #6b7280; font-size: 0.875rem; margin-bottom: 0.5rem;">
+                "Customer: scan this QR to receive your change"
+            </p>
+            <div class="qr-container">
+                {move || {
+                    let idx = current_frame.get();
+                    let fs = frames_signal.get();
+                    let data = &fs[idx % fs.len()];
+                    match qr::generate_qr_svg(data) {
+                        Ok(svg) => view! { <div inner_html=svg></div> }.into_any(),
+                        Err(e) => view! { <p style="color: red;">{e}</p> }.into_any(),
+                    }
+                }}
+            </div>
+            {(frame_count > 1).then(|| view! {
+                <div class="progress-bar">
+                    <div class="progress-bar-fill"
+                        style=move || format!("width: {}%", ((current_frame.get() + 1) as f64 / frame_count as f64) * 100.0)>
+                    </div>
+                </div>
+            })}
+            <button class="btn btn-blue" style="margin-top: 1rem;" on:click=move |_| view.set(AppView::Pos)>
+                "Done"
+            </button>
         </div>
     }
 }
