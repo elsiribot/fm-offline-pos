@@ -6,7 +6,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::ecash;
 use crate::exchange::{self, RateMap};
-use crate::qr::{self, AnimatedQrCollector};
+use crate::qr::{self, AnimatedQrCollector, ProcessResult};
 use crate::scanner;
 use crate::storage::{self, PosConfig, Transaction, TxType, Wallet};
 
@@ -403,13 +403,26 @@ fn ScanDepositView(
                                 break;
                             }
                             if let Some(raw) = scanner::scan_frame(&video).await {
-                                let complete = collector.try_update(|c| c.add_frame(&raw)).flatten();
-                                progress.set(collector.get_untracked().progress());
-                                if let Some(data) = complete {
+                                // Try direct ecash parse first (static QR)
+                                if ecash::parse_notes(&raw).is_ok() {
                                     scanner::stop_camera(&stream);
                                     scanning.set(false);
-                                    process_ecash_scan(data);
+                                    process_ecash_scan(raw);
                                     break;
+                                }
+                                // Try as qrloop animated frame
+                                let result = collector.try_update(|c| c.process_scan(&raw));
+                                match result {
+                                    Some(ProcessResult::Complete(data)) => {
+                                        scanner::stop_camera(&stream);
+                                        scanning.set(false);
+                                        process_ecash_scan(data);
+                                        break;
+                                    }
+                                    Some(ProcessResult::Progress(p)) => {
+                                        progress.set(p);
+                                    }
+                                    _ => {} // NotAFrame or None — ignore
                                 }
                             }
                         }
@@ -652,13 +665,26 @@ fn AwaitPaymentView(
                                 break;
                             }
                             if let Some(raw) = scanner::scan_frame(&video).await {
-                                let complete = collector.try_update(|c| c.add_frame(&raw)).flatten();
-                                progress.set(collector.get_untracked().progress());
-                                if let Some(data) = complete {
+                                // Try direct ecash parse first (static QR)
+                                if ecash::parse_notes(&raw).is_ok() {
                                     scanner::stop_camera(&stream);
                                     scanning.set(false);
-                                    process_payment_scan(data);
+                                    process_payment_scan(raw);
                                     break;
+                                }
+                                // Try as qrloop animated frame
+                                let result = collector.try_update(|c| c.process_scan(&raw));
+                                match result {
+                                    Some(ProcessResult::Complete(data)) => {
+                                        scanner::stop_camera(&stream);
+                                        scanning.set(false);
+                                        process_payment_scan(data);
+                                        break;
+                                    }
+                                    Some(ProcessResult::Progress(p)) => {
+                                        progress.set(p);
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
