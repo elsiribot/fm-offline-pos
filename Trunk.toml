@@ -4,7 +4,7 @@ target = "index.html"
 filehash = false
 
 [watch]
-watch = ["crates/pos-web", "public", "index.html", "style.css"]
+watch = ["crates/pos-web", "index.html", "style.css"]
 
 [serve]
 addresses = ["127.0.0.1"]
