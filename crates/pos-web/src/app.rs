@@ -6,7 +6,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::ecash;
 use crate::exchange::{self, RateMap};
-use crate::qr::{self, AnimatedQrCollector, ProcessResult};
+use crate::qr::{self, QrloopCollector, ProcessResult};
 use crate::scanner;
 use crate::storage::{self, PosConfig, Transaction, TxType, Wallet};
 
@@ -354,7 +354,7 @@ fn ScanDepositView(
     let error = RwSignal::new(None::<String>);
     let progress = RwSignal::new(0.0f64);
     let video_ref = NodeRef::<Video>::new();
-    let collector = RwSignal::new(AnimatedQrCollector::new());
+    let collector = RwSignal::new(QrloopCollector::new());
 
     let process_ecash = move |data: String| {
         let cfg = config.get();
@@ -612,7 +612,7 @@ fn AwaitPaymentView(
     let error = RwSignal::new(None::<String>);
     let progress = RwSignal::new(0.0f64);
     let video_ref = NodeRef::<Video>::new();
-    let collector = RwSignal::new(AnimatedQrCollector::new());
+    let collector = RwSignal::new(QrloopCollector::new());
 
     let process_payment = move |data: String| {
         let cfg = config.get();
@@ -655,7 +655,17 @@ fn AwaitPaymentView(
                     let mut w = wallet.get();
                     if let Some(change_notes) = w.withdraw_exact(change_msats) {
                         wallet.set(w);
+                        tracing::info!(
+                            num_notes = change_notes.len(),
+                            change_msats,
+                            "change: withdrawn notes for change"
+                        );
                         if let Ok(ecash_str) = ecash::combine_note_strings(&change_notes) {
+                            tracing::info!(
+                                ecash_len = ecash_str.len(),
+                                ecash_start = &ecash_str[..ecash_str.len().min(40)],
+                                "change: combined ecash string"
+                            );
                             storage::add_transaction(Transaction {
                                 timestamp: js_sys::Date::now() as u64,
                                 amount_msats: requested_msats,
@@ -817,10 +827,12 @@ fn AwaitPaymentView(
 
 #[component]
 fn AnimatedQrView(title: String, ecash_str: String, view: RwSignal<AppView>) -> impl IntoView {
+    let ecash_for_copy = ecash_str.clone();
     let frames = qr::split_for_animated_qr(&ecash_str, QR_CHUNK_SIZE);
     let frame_count = frames.len();
     let current_frame = RwSignal::new(0usize);
     let frames_signal = RwSignal::new(frames);
+    let copied = RwSignal::new(false);
 
     if frame_count > 1 {
         spawn_local(async move {
@@ -855,7 +867,8 @@ fn AnimatedQrView(title: String, ecash_str: String, view: RwSignal<AppView>) -> 
                     {move || format!("Frame {}/{}", current_frame.get() + 1, frame_count)}
                 </p>
             })}
-            <button class="btn btn-blue" style="margin-top: 1rem;" on:click=move |_| view.set(AppView::Pos)>"Done"</button>
+            <CopyButton ecash=ecash_for_copy copied=copied />
+            <button class="btn btn-blue" style="margin-top: 0.5rem;" on:click=move |_| view.set(AppView::Pos)>"Done"</button>
         </div>
     }
 }
@@ -887,10 +900,12 @@ fn PaymentSuccessView(received_sats: u64, change_sats: u64, view: RwSignal<AppVi
 
 #[component]
 fn GiveChangeView(ecash_str: String, received_sats: u64, change_sats: u64, view: RwSignal<AppView>) -> impl IntoView {
+    let ecash_for_copy = ecash_str.clone();
     let frames = qr::split_for_animated_qr(&ecash_str, QR_CHUNK_SIZE);
     let frame_count = frames.len();
     let current_frame = RwSignal::new(0usize);
     let frames_signal = RwSignal::new(frames);
+    let copied = RwSignal::new(false);
 
     if frame_count > 1 {
         spawn_local(async move {
@@ -931,7 +946,8 @@ fn GiveChangeView(ecash_str: String, received_sats: u64, change_sats: u64, view:
                     </div>
                 </div>
             })}
-            <button class="btn btn-blue" style="margin-top: 1rem;" on:click=move |_| view.set(AppView::Pos)>
+            <CopyButton ecash=ecash_for_copy copied=copied />
+            <button class="btn btn-blue" style="margin-top: 0.5rem;" on:click=move |_| view.set(AppView::Pos)>
                 "Done"
             </button>
         </div>
@@ -1017,7 +1033,17 @@ fn AdminView(
         let mut w = wallet.get();
         if let Some(notes) = w.withdraw_exact(withdraw_msats) {
             wallet.set(w);
+            tracing::info!(
+                num_notes = notes.len(),
+                withdraw_msats,
+                "withdraw: withdrawn notes"
+            );
             if let Ok(ecash_str) = ecash::combine_note_strings(&notes) {
+                tracing::info!(
+                    ecash_len = ecash_str.len(),
+                    ecash_start = &ecash_str[..ecash_str.len().min(40)],
+                    "withdraw: combined ecash string"
+                );
                 storage::add_transaction(Transaction {
                     timestamp: js_sys::Date::now() as u64,
                     amount_msats: withdraw_msats,
@@ -1108,6 +1134,31 @@ fn AdminView(
 }
 
 // ─── Shared Components ──────────────────────────────────────────
+
+#[component]
+fn CopyButton(ecash: String, copied: RwSignal<bool>) -> impl IntoView {
+    let ecash_clone = ecash.clone();
+    view! {
+        <button
+            class={move || if copied.get() { "btn btn-gray" } else { "btn btn-gray" }}
+            style="margin-top: 0.5rem;"
+            on:click=move |_| {
+                let e = ecash_clone.clone();
+                spawn_local(async move {
+                    if let Some(window) = web_sys::window() {
+                        let clipboard = window.navigator().clipboard();
+                        let _ = wasm_bindgen_futures::JsFuture::from(
+                            clipboard.write_text(&e)
+                        ).await;
+                        copied.set(true);
+                    }
+                });
+            }
+        >
+            {move || if copied.get() { "Copied!" } else { "Copy ecash" }}
+        </button>
+    }
+}
 
 #[component]
 fn PinNumpad(

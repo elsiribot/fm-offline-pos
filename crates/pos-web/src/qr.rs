@@ -2,6 +2,7 @@ use qrcode::render::svg;
 use qrcode::QrCode;
 
 use base64::Engine;
+use wasm_bindgen::JsCast;
 
 /// Generate a static QR code as SVG string
 pub fn generate_qr_svg(data: &str) -> Result<String, String> {
@@ -15,192 +16,170 @@ pub fn generate_qr_svg(data: &str) -> Result<String, String> {
     Ok(svg_str)
 }
 
-/// Split data into qrloop-compatible frames for animated QR display.
-pub fn split_for_animated_qr(data: &str, max_chunk_size: usize) -> Vec<String> {
-    let raw_bytes = data.as_bytes();
-
-    // Wrap data: 4-byte length + 16-byte md5-like hash + data
-    let mut wrapped = Vec::with_capacity(20 + raw_bytes.len());
-    wrapped.extend_from_slice(&(raw_bytes.len() as u32).to_be_bytes());
-    wrapped.extend_from_slice(&simple_hash(raw_bytes));
-    wrapped.extend_from_slice(raw_bytes);
-
-    let chunks: Vec<&[u8]> = wrapped.chunks(max_chunk_size).collect();
-    let total = chunks.len();
-
-    if total <= 1 {
-        return vec![data.to_string()];
-    }
-
-    chunks
-        .iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            let mut frame = Vec::with_capacity(5 + chunk.len());
-            frame.push(0u8); // nonce
-            frame.extend_from_slice(&(total as u16).to_be_bytes());
-            frame.extend_from_slice(&(i as u16).to_be_bytes());
-            frame.extend_from_slice(chunk);
-            base64::engine::general_purpose::STANDARD.encode(&frame)
-        })
-        .collect()
-}
-
-fn simple_hash(data: &[u8]) -> [u8; 16] {
-    let mut hash = [0u8; 16];
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    hash[..8].copy_from_slice(&h.to_le_bytes());
-    h = h.wrapping_mul(0x100000001b3);
-    for &b in data.iter().rev() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    hash[8..].copy_from_slice(&h.to_le_bytes());
-    hash
-}
-
-/// Try to parse a scanned QR string as a qrloop frame.
-/// Returns (total_frames, frame_index, data_chunk) if valid.
-fn try_parse_qrloop_frame(raw: &str) -> Option<(usize, usize, Vec<u8>)> {
-    let frame_bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
-    if frame_bytes.len() < 6 {
-        return None; // Too short for qrloop header + any data
-    }
-
-    let _nonce = frame_bytes[0];
-    let total = u16::from_be_bytes([frame_bytes[1], frame_bytes[2]]) as usize;
-    let index = u16::from_be_bytes([frame_bytes[3], frame_bytes[4]]) as usize;
-    let data = frame_bytes[5..].to_vec();
-
-    // Strict validation
-    if total < 2 || total > 500 {
-        return None; // Single-frame wouldn't use qrloop; >500 is unreasonable
-    }
-    if index >= total {
-        return None;
-    }
-    if data.is_empty() {
-        return None;
-    }
-
-    Some((total, index, data))
-}
-
-/// Assemble collected qrloop frames into the final ecash string.
-/// Unwraps qrloop data format: [length(4 BE)] [md5(16)] [raw_ecash_bytes]
-/// Since Fedi passes Buffer.from(ecash, 'base64') to dataToFrames,
-/// the raw bytes are the decoded ecash — we re-encode as base64 URL-safe.
-pub fn assemble_qrloop_frames(frames: &[Vec<u8>]) -> Option<String> {
-    let mut assembled = Vec::new();
-    for frame in frames {
-        assembled.extend_from_slice(frame);
-    }
-
-    if assembled.len() < 20 {
-        return None;
-    }
-
-    let data_len =
-        u32::from_be_bytes([assembled[0], assembled[1], assembled[2], assembled[3]]) as usize;
-
-    let raw_data = &assembled[20..]; // skip length(4) + hash(16)
-
-    if raw_data.len() < data_len {
-        return None;
-    }
-
-    let ecash_bytes = &raw_data[..data_len];
-
-    // Re-encode as base64 URL-safe (this is what ecash::parse_notes expects)
-    let engine = base64::engine::GeneralPurpose::new(
+/// Split a base64 ecash string into qrloop frames using the actual qrloop JS library.
+/// Matches Fedi: `dataToFrames(Buffer.from(ecash, 'base64'))`.
+pub fn split_for_animated_qr(ecash_base64: &str, _chunk_size: usize) -> Vec<String> {
+    // Decode ecash base64 to raw bytes
+    let raw_bytes = base64::engine::GeneralPurpose::new(
         &base64::alphabet::URL_SAFE,
         base64::engine::general_purpose::PAD,
+    )
+    .decode(ecash_base64)
+    .or_else(|_| base64::engine::general_purpose::STANDARD.decode(ecash_base64))
+    .unwrap_or_else(|_| ecash_base64.as_bytes().to_vec());
+
+    tracing::info!(
+        ecash_len = ecash_base64.len(),
+        raw_len = raw_bytes.len(),
+        "split_for_animated_qr: encoding with qrloop"
     );
-    Some(engine.encode(ecash_bytes))
-}
 
-/// State for collecting qrloop animated QR frames.
-#[derive(Clone, Debug)]
-pub struct AnimatedQrCollector {
-    frames: Vec<Option<Vec<u8>>>,
-    total: usize,
-    received: usize,
-}
-
-impl AnimatedQrCollector {
-    pub fn new() -> Self {
-        Self {
-            frames: Vec::new(),
-            total: 0,
-            received: 0,
+    // Call qrloop.dataToFrames(Uint8Array) from JS
+    if let Some(frames) = call_qrloop_data_to_frames(&raw_bytes) {
+        tracing::info!(num_frames = frames.len(), "split_for_animated_qr: got frames from qrloop");
+        if !frames.is_empty() {
+            return frames;
         }
     }
 
-    /// Process a scanned QR string.
-    /// Returns:
-    ///   ProcessResult::Complete(ecash_string) — ready to parse
-    ///   ProcessResult::Progress(fraction) — still collecting frames
-    ///   ProcessResult::NotAFrame — not a qrloop frame, caller should try direct parse
+    tracing::warn!("split_for_animated_qr: qrloop not available, falling back to single QR");
+    vec![ecash_base64.to_string()]
+}
+
+/// Call window.qrloop.dataToFrames(Uint8Array) -> string[]
+fn call_qrloop_data_to_frames(data: &[u8]) -> Option<Vec<String>> {
+    let window = web_sys::window()?;
+    let qrloop = js_sys::Reflect::get(&window, &"qrloop".into()).ok()?;
+    if qrloop.is_undefined() {
+        return None;
+    }
+    let dtf: js_sys::Function = js_sys::Reflect::get(&qrloop, &"dataToFrames".into())
+        .ok()?
+        .dyn_into()
+        .ok()?;
+
+    let uint8 = js_sys::Uint8Array::from(data);
+    let result = dtf
+        .call1(&wasm_bindgen::JsValue::NULL, &uint8)
+        .ok()?;
+    let arr: js_sys::Array = result.dyn_into().ok()?;
+
+    let mut frames = Vec::new();
+    for i in 0..arr.length() {
+        if let Some(s) = arr.get(i).as_string() {
+            frames.push(s);
+        }
+    }
+    Some(frames)
+}
+
+/// Process a scanned QR string through qrloop.parseFramesReducer.
+/// Returns the collector state as an opaque JsValue.
+pub struct QrloopCollector {
+    state: wasm_bindgen::JsValue,
+}
+
+impl QrloopCollector {
+    pub fn new() -> Self {
+        Self {
+            state: wasm_bindgen::JsValue::NULL,
+        }
+    }
+
+    /// Feed a scanned frame. Returns ProcessResult.
     pub fn process_scan(&mut self, raw: &str) -> ProcessResult {
-        let Some((total, index, data)) = try_parse_qrloop_frame(raw) else {
+        let Some(window) = web_sys::window() else {
+            return ProcessResult::NotAFrame;
+        };
+        let Ok(qrloop) = js_sys::Reflect::get(&window, &"qrloop".into()) else {
+            return ProcessResult::NotAFrame;
+        };
+        if qrloop.is_undefined() {
+            return ProcessResult::NotAFrame;
+        }
+
+        // parseFramesReducer(state, chunkStr)
+        let Ok(pfr) = js_sys::Reflect::get(&qrloop, &"parseFramesReducer".into()) else {
+            return ProcessResult::NotAFrame;
+        };
+        let Ok(pfr_fn) = pfr.dyn_into::<js_sys::Function>() else {
             return ProcessResult::NotAFrame;
         };
 
-        // If total changed and we had progress, don't reset — skip this frame
-        if self.total != 0 && self.total != total {
-            return ProcessResult::Progress(self.progress());
-        }
+        let new_state = match pfr_fn.call2(
+            &wasm_bindgen::JsValue::NULL,
+            &self.state,
+            &wasm_bindgen::JsValue::from_str(raw),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(?e, "qrloop parseFramesReducer threw");
+                return ProcessResult::NotAFrame;
+            }
+        };
 
-        // Initialize on first valid frame
-        if self.total == 0 {
-            self.frames = vec![None; total];
-            self.total = total;
-            self.received = 0;
-        }
+        self.state = new_state;
 
-        if self.frames[index].is_none() {
-            self.frames[index] = Some(data);
-            self.received += 1;
-        }
+        // Get progress
+        let progress = call_js_fn(&qrloop, "progressOfFrames", &self.state)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
 
-        if self.received >= self.total {
-            let frame_data: Vec<Vec<u8>> = self
-                .frames
-                .iter()
-                .filter_map(|f| f.clone())
-                .collect();
+        tracing::debug!(progress, "qrloop: frame processed");
 
-            if let Some(ecash_str) = assemble_qrloop_frames(&frame_data) {
-                return ProcessResult::Complete(ecash_str);
+        // Check completion
+        let complete = call_js_fn(&qrloop, "areFramesComplete", &self.state)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if complete {
+            tracing::info!("qrloop: all frames collected, assembling");
+            let ftd_result = js_sys::Reflect::get(&qrloop, &"framesToData".into())
+                .ok()
+                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                .map(|f| f.call1(&wasm_bindgen::JsValue::NULL, &self.state));
+
+            match ftd_result {
+                Some(Ok(data)) => {
+                    if let Ok(uint8) = data.dyn_into::<js_sys::Uint8Array>() {
+                        let bytes = uint8.to_vec();
+                        tracing::info!(data_len = bytes.len(), "qrloop: assembled data");
+                        let engine = base64::engine::GeneralPurpose::new(
+                            &base64::alphabet::URL_SAFE,
+                            base64::engine::general_purpose::PAD,
+                        );
+                        return ProcessResult::Complete(engine.encode(&bytes));
+                    } else {
+                        tracing::warn!("qrloop: framesToData returned non-Uint8Array");
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(?e, "qrloop: framesToData threw");
+                }
+                None => {
+                    tracing::warn!("qrloop: framesToData function not found");
+                }
             }
         }
 
-        ProcessResult::Progress(self.progress())
-    }
-
-    pub fn progress(&self) -> f64 {
-        if self.total == 0 {
-            return 0.0;
-        }
-        self.received as f64 / self.total as f64
+        ProcessResult::Progress(progress)
     }
 
     pub fn reset(&mut self) {
-        self.frames.clear();
-        self.total = 0;
-        self.received = 0;
+        self.state = wasm_bindgen::JsValue::NULL;
     }
 }
 
+fn call_js_fn(obj: &wasm_bindgen::JsValue, name: &str, arg: &wasm_bindgen::JsValue) -> Option<wasm_bindgen::JsValue> {
+    let func: js_sys::Function = js_sys::Reflect::get(obj, &name.into())
+        .ok()?
+        .dyn_into()
+        .ok()?;
+    func.call1(&wasm_bindgen::JsValue::NULL, arg).ok()
+}
+
 pub enum ProcessResult {
-    /// All frames collected, here's the ecash string
     Complete(String),
-    /// Still collecting, here's the progress (0.0-1.0)
     Progress(f64),
-    /// Not a qrloop frame — the raw string might be direct ecash
     NotAFrame,
 }

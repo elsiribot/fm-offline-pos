@@ -132,7 +132,7 @@ impl Wallet {
         amount: u64,
         available: &BTreeMap<u64, usize>,
     ) -> Option<BTreeMap<u64, usize>> {
-        const TOLERANCE: u64 = 1000; // 1 sat in msats
+        let tolerance = (amount / 100).max(1000); // 1% or 1 sat, whichever is larger
 
         let mut remaining = amount;
         let mut plan: BTreeMap<u64, usize> = BTreeMap::new();
@@ -154,7 +154,7 @@ impl Wallet {
         }
 
         // Exact or close enough (gave slightly too little change, delta <= 1 sat)
-        if remaining <= TOLERANCE {
+        if remaining <= tolerance {
             tracing::debug!(remaining, "plan: greedy sufficient");
             return Some(plan);
         }
@@ -188,7 +188,7 @@ impl Wallet {
             tracing::debug!(bump_denom, delta, new_plan = ?new_plan, "plan: bump candidate");
 
             // Over-changed by <= 1 sat — acceptable
-            if delta <= TOLERANCE {
+            if delta <= tolerance {
                 tracing::debug!(bump_denom, delta, "plan: bump accepted");
                 return Some(new_plan);
             }
